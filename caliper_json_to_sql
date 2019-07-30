@@ -1,0 +1,51 @@
+# Alternative very early sql prototype
+# Comment: The returned body could /should be a empty body. There's no header authentication check
+
+from flask import Flask, jsonify, request, abort
+from flaskext.mysql import MySQL ### new for sql connector
+from functools import wraps
+import os, ssl, json, time, datetime
+
+app = Flask(__name__)
+mysql = MySQL()  ### define
+
+### MySQL configuration
+app.config['MYSQL_DATABASE_USER'] = 'sql_user_name'
+app.config['MYSQL_DATABASE_PASSWORD'] = 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+app.config['MYSQL_DATABASE_DB'] = 'my_db'
+app.config['MYSQL_DATABASE_HOST'] = 'my_host'
+
+mysql.init_app(app) ### init
+
+@app.route('/caliper', methods=['POST'])
+@require_appkey
+
+def post():
+
+    incomingEVENT = request.get_json()
+
+    ### need to parse out nulls
+    
+### column names are defined here...make sure the order matches the column names below
+    add_event = """INSERT INTO my_db.table1 (c_object_type, c_object, c_actor_netid, c_action, c_eventTime, c_name, c_course_id) VALUES (%s, %s, %s, %s, %s, %s, %s)"""
+
+### temp variables are defined here to hold parsed values
+    EVENT = {
+        'myobject': request.json['data'][0]['object']['@id'],
+        'myactor_netid': request.json['data'][0]['membership']['extensions']['bb:user.externalId'],
+        'myaction': request.json['data'][0]['action'],
+        'myobject_type': request.json['data'][0]['object']['@type'],
+        'myeventTime': request.json['data'][0]['eventTime'],
+        'myobjectname': request.json['data'][0]['object']['name'],
+        'mycourse_id': request.json['data'][0]['membership']['extensions']['bb:course.externalId']
+    }
+
+    conn = mysql.connect() ### connect
+    cur = conn.cursor()    ### cursorize
+
+### write these to the columns in DB
+    cur.execute(add_event, (EVENT['myobject'], EVENT['myobject_type'], EVENT['myactor_netid'], EVENT['myaction'], EVENT['myeventTime'], EVENT['myobjectname'], EVENT['mycourse_id']))
+
+    conn.commit()          ### commit line entry
+
+    return jsonify({'event': EVENT}), 201
