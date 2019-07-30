@@ -1,0 +1,148 @@
+#!/usr/bin/env python
+# json_to-disk: log json web events, e.g. Caliper events, to disk
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+# PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE CONTRIBUTORS OR COPYRIGHT HOLDERS BE 
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT 
+# OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+# DEALINGS WITH THE SOFTWARE. 
+
+# Authors: 
+# Reynolds, Mark A <reynlds@illinois.edu>
+# Angrave, Lawrence <angrave@illinois.edu>
+
+# IMS Global Caliper spec:
+# See V1.1:  https://www.imsglobal.org/sites/default/files/caliper/v1p1/caliper-spec-v1p1/caliper-spec-v1p1.html
+
+# Versions:
+# v.002  "Rosetta Stone" original by Reynolds, Mark A <reynlds@illinois.edu> 2018
+# v.003  Minor performance and scaling modifications -
+# Added Thread  and process safety (using mutex locks; filenames unique to each process id, respectively)
+# Keep file handles open over multiple events
+# Log files are renamed from ".partial" to %d.json upon graceful shutdown (CTRL-C) and rotating events
+# Use atexit to attempt to create a valid log file exiting with CTRL-C
+
+# Concerns: Since this is a direct-to-disk implementation there's a potential to drop incoming events during a slow file rotation.
+# Some ideas / todos: 
+# open source license: https://opensource.org/licenses/NCSA
+# Refactor into module/class to remove globals and clean up code.
+# Store key and data dir in a configuration file rather than passing in as environment variables?
+# Better Error handling: If an error occurs, is it best to quit and restart 1 minute later?
+
+import os, sys, ssl, json, time, datetime,threading, atexit
+from flask import Flask, jsonify, request, abort
+from functools import wraps
+
+app = Flask(__name__)
+
+def quit(message,exit_value=1):
+    print(message)
+    sys.exit(exit_value)
+
+try:  
+    datalogdir = os.environ["DATA_LOG_DIR"] # throws KeyError if missing
+    if not os.path.isdir(datalogdir): 
+        raise KeyError()
+except KeyError: 
+    quit("Set the environment variable DATA_LOG_DIR to a valid directory")
+
+try:  
+    datalogkey = os.environ["DATA_LOG_AUTH_KEY"]
+    if len(datalogkey)==0: 
+        raise KeyError()
+except KeyError: 
+    quit("Set the environment variable DATA_LOG_AUTH_KEY to a non-empty key string to validate the Authorization header")
+
+# The actual decorator function for flask
+def require_appkey(view_function):
+    @wraps(view_function)
+    def decorated_function(*args, **kwargs):     
+        if request.headers.get('Authorization') and request.headers.get('Authorization') == datalogkey:
+            return view_function(*args, **kwargs)
+        else:
+            abort(401)
+    return decorated_function
+    
+        
+# Utility function to recursively remove all null(None) values from the json object
+def remove_nulls(d):
+    if not isinstance(d, (dict, list)):
+        return d
+    if isinstance(d, list):
+        return [v for v in (remove_nulls(v) for v in d) if v]
+    return {k: v for k, v in ((k, remove_nulls(v)) for k, v in d.items()) if v}
+
+pid = str(os.getpid())
+file_lock = threading.Lock()
+
+needs_comma_sep = False
+datalog = None
+previous = None
+
+# The primary route 
+@app.route('/caliper', methods=['POST'])
+@require_appkey
+def post():
+    global pid,file_lock,needs_comma_sep
+    message = request.get_json(force=True) # we will accept anybodies json object
+    message = remove_nulls(message)
+    message = json.dumps(message,separators=(',',':'), ensure_ascii=False) + '\n'
+    
+    with file_lock:
+        reuse_or_open_datalog()
+        # First entry does not need a comma separator
+        if needs_comma_sep:
+            message = ',' + message
+        else: 
+            needs_comma_sep = True
+        
+        datalog.write(message)
+    return jsonify({'event': message}), 201
+            
+def close_datalog():
+    global datalog,filepath
+    if(datalog is None):
+        print('close_datalog: datalog is None')
+        return
+
+    datalog.write('}\n')
+    datalog.close()
+    datalog = None
+    dupe_counter = 0
+    target = "%s.json" % (filepath)
+    while os.path.exists(target):
+        dupe_counter += 1
+        target = "%s-%d.json" % (filepath, dupe_counter)       
+    os.rename(filepath+'.partial',target)
+    filepath = None
+        
+# assumes filelock is already acquired
+def reuse_or_open_datalog():
+    global previous,datalog,pid,now,filepath,needs_comma_sep
+    
+    #Include process id in the filename(multiple threads per same process are handled using the lock)
+    now = time.strftime('%Y-%m-%d_%H') ### <-- includeM for minute (log rotation)
+    if((now == previous) and datalog is not None):
+        return
+        
+    close_datalog()
+    
+    filename = '%s-pid-%s' % (now, pid)
+    filepath = os.path.join(datalogdir,filename)
+    partial = filepath+'.partial'
+    
+    datalog = open(partial,'a')
+    datalog.write('\n')
+    # Handle restarts gracefully by appending to existing file, and only adding opening brace if there are no records yet
+    
+    needs_comma_sep = os.stat(partial).st_size >3
+    if( not needs_comma_sep ):
+        datalog.write('{')
+    
+    previous = now
+    
+# run app
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', ssl_context='adhoc')
+
+atexit.register(close_datalog)
